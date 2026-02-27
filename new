@@ -6,101 +6,221 @@ import numpy as np
 from scipy.stats import linregress
 from datetime import timedelta
 
-# --- 1. Load the CSV ---
-# Adjust names based on your spreadsheet columns
-df = pd.read_csv("bogue_chitto_tylertown_historiccrests.csv", header=None, names=["rank", "height_str", "date_str", "empty"])
 
-# Extract numerical height and datetime objects
-df['crest_height'] = df['height_str'].apply(lambda x: float(re.search(r'[\d\.]+', str(x)).group()) if pd.notnull(x) else None)
-df['crest_date'] = df['date_str'].apply(lambda x: pd.to_datetime(re.search(r'\d{2}-\d{2}-\d{4}', str(x)).group()) if pd.notnull(x) else None)
-df = df.dropna(subset=['crest_height', 'crest_date'])
+# ==========================
+# CONFIG
+# ==========================
 
-# --- 2. Configuration ---
-station_id = "02490500" # USGS ID for Bogue Chitto River near Tylertown, MS
-reference_stage = 15.0  # The stage at which we want to check the rate of rise (e.g., Flood Stage)
-results = []
+# CSV with historic crest data (already in your repo)
+CSV_PATH = "bogue_chitto_tylertown_historiccrests.csv"
 
-print(f"Fetching USGS data for {len(df)} historic events. This may take a minute...")
+# USGS site and analysis parameters
+STATION_ID = "02490500"       # Bogue Chitto River near Tylertown, MS
+REFERENCE_STAGE = 15.0        # Stage (ft) where we sample rate-of-rise
+MIN_IV_YEAR = 1990            # Skip events before this year (no IV data)
 
-# --- 3. Fetch Data & Calculate Rate of Rise ---
-for index, row in df.iterrows():
-    crest_date = row['crest_date']
-    crest_height = row['crest_height']
-    
-    # We want data from 4 days before the crest to 1 day after
-    start_dt = (crest_date - timedelta(days=4)).strftime('%Y-%m-%d')
-    end_dt = (crest_date + timedelta(days=1)).strftime('%Y-%m-%d')
-    
-    # Query USGS NWIS Instantaneous Values API (Parameter 00065 is Gage Height)
-    url = f"https://nwis.waterservices.usgs.gov/nwis/iv/?site={station_id}&startDT={start_dt}&endDT={end_dt}&parameterCd=00065&format=json"
-    
-    try:
-        response = requests.get(url)
-        data = response.json()
-        
-        # Check if USGS actually has 15-min data for this historical date
-        if 'value' in data and 'timeSeries' in data['value'] and len(data['value']['timeSeries']) > 0:
-            ts_data = data['value']['timeSeries'][0]['values'][0]['value']
-            
-            # Convert JSON to a DataFrame
-            event_df = pd.DataFrame(ts_data)
-            event_df['value'] = pd.to_numeric(event_df['value'], errors='coerce')
-            event_df['dateTime'] = pd.to_datetime(event_df['dateTime'])
-            event_df = event_df.set_index('dateTime').dropna()
-            
-            # Resample to Hourly to smooth out 15-min jitters and get Hourly Rate of Rise
-            hourly_df = event_df.resample('1H').mean()
-            hourly_df['rate_of_rise'] = hourly_df['value'].diff() # ft per hour difference
-            
-            # Find the earliest time it crossed our reference stage (15 ft)
-            crossed_idx = hourly_df[hourly_df['value'] >= reference_stage].index.min()
-            
-            if pd.notnull(crossed_idx):
-                rate = hourly_df.loc[crossed_idx, 'rate_of_rise']
-                
-                # Make sure the river was rising (positive rate) and not on the falling limb
-                if rate > 0:
-                    results.append({
-                        'crest_date': crest_date.date(),
-                        'crest_height': crest_height,
-                        'rate_of_rise_per_hr': rate
-                    })
-    except Exception as e:
-        # USGS 15-minute gauge data usually only goes back to the late 80s / early 90s.
-        # Older events (like 1936) will gracefully fail here.
-        pass
 
-# --- 4. The "Fancier" Math (Correlation & Skill) ---
-results_df = pd.DataFrame(results)
+# ==========================
+# HELPER FUNCTIONS
+# ==========================
 
-if len(results_df) > 0:
-    x = results_df['rate_of_rise_per_hr']
-    y = results_df['crest_height']
-    
-    # Linear Regression
+def parse_crest_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Read the historic crests CSV and extract:
+      - crest_height (float feet)
+      - crest_date (datetime)
+    Assumes format like:
+       rank, "34.70 ft", "on 02-01-1936", empty
+    """
+
+    df = pd.read_csv(
+        csv_path,
+        header=None,
+        names=["rank", "height_str", "date_str", "empty"]
+    )
+
+    # Extract numeric height
+    def extract_height(text):
+        if pd.isna(text):
+            return None
+        m = re.search(r"[\d\.]+", str(text))
+        return float(m.group()) if m else None
+
+    # Extract date
+    def extract_date(text):
+        if pd.isna(text):
+            return None
+        m = re.search(r"\d{2}-\d{2}-\d{4}", str(text))
+        if not m:
+            return None
+        return pd.to_datetime(m.group(), format="%m-%d-%Y")
+
+    df["crest_height"] = df["height_str"].apply(extract_height)
+    df["crest_date"] = df["date_str"].apply(extract_date)
+
+    df = df.dropna(subset=["crest_height", "crest_date"]).reset_index(drop=True)
+    return df
+
+
+def fetch_usgs_iv(station_id: str, start_dt: str, end_dt: str) -> pd.DataFrame:
+    """
+    Fetch USGS IV gage height data for a window and return as DataFrame
+    indexed by datetime with a 'value' column (feet).
+    """
+    url = (
+        "https://nwis.waterservices.usgs.gov/nwis/iv/"
+        f"?site={station_id}"
+        f"&startDT={start_dt}"
+        f"&endDT={end_dt}"
+        "&parameterCd=00065"
+        "&format=json"
+    )
+
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    ts_list = data.get("value", {}).get("timeSeries", [])
+    if not ts_list:
+        return pd.DataFrame()
+
+    ts_data = ts_list[0]["values"][0]["value"]
+    event_df = pd.DataFrame(ts_data)
+
+    event_df["value"] = pd.to_numeric(event_df["value"], errors="coerce")
+    event_df["dateTime"] = pd.to_datetime(event_df["dateTime"])
+    event_df = event_df.set_index("dateTime").dropna()
+
+    return event_df
+
+
+# ==========================
+# MAIN ANALYSIS
+# ==========================
+
+def main():
+    # --- 1. Load historic crest data ---
+    df = parse_crest_csv(CSV_PATH)
+    print(f"Total historic crest entries in CSV: {len(df)}")
+
+    results = []
+    valid_event_count = 0
+    skipped_event_count = 0
+
+    print(
+        f"\nFetching USGS IV data for events "
+        f"({STATION_ID}, reference stage {REFERENCE_STAGE} ft)...\n"
+    )
+
+    # --- 2. Loop over each crest event ---
+    for _, row in df.iterrows():
+        crest_date = row["crest_date"]
+        crest_height = row["crest_height"]
+
+        # Skip events before IV record is likely to exist
+        if crest_date.year < MIN_IV_YEAR:
+            skipped_event_count += 1
+            continue
+
+        print(f"Processing crest {crest_date.date()} (height {crest_height:.2f} ft)")
+
+        # 4 days before to 1 day after crest
+        start_dt = (crest_date - timedelta(days=4)).strftime("%Y-%m-%d")
+        end_dt = (crest_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        try:
+            event_df = fetch_usgs_iv(STATION_ID, start_dt, end_dt)
+
+            if event_df.empty:
+                print("  -> No IV data returned, skipping.")
+                skipped_event_count += 1
+                continue
+
+            # Resample to hourly and compute hourly rate-of-rise
+            hourly_df = event_df.resample("1H").mean()
+            hourly_df["rate_of_rise"] = hourly_df["value"].diff()
+
+            # First time river crosses reference stage
+            crossed_idx = hourly_df[hourly_df["value"] >= REFERENCE_STAGE].index.min()
+
+            if pd.isna(crossed_idx):
+                print(
+                    f"  -> Never reached {REFERENCE_STAGE} ft in this window, skipping."
+                )
+                skipped_event_count += 1
+                continue
+
+            rate = hourly_df.loc[crossed_idx, "rate_of_rise"]
+
+            if pd.isna(rate) or rate <= 0:
+                print("  -> Rate at crossing is non-positive or NaN, skipping.")
+                skipped_event_count += 1
+                continue
+
+            # Success for this event
+            print(f"  -> Valid event. Rate at {REFERENCE_STAGE} ft = {rate:.3f} ft/hr")
+            results.append(
+                {
+                    "crest_date": crest_date.date(),
+                    "crest_height": crest_height,
+                    "rate_of_rise_per_hr": rate,
+                    "cross_time": crossed_idx,
+                }
+            )
+            valid_event_count += 1
+
+        except Exception as e:
+            print(f"  -> ERROR fetching/processing data: {e}")
+            skipped_event_count += 1
+
+    print("\n==============================")
+    print(f"Valid events used in analysis:   {valid_event_count}")
+    print(f"Events skipped (any reason):     {skipped_event_count}")
+    print("==============================\n")
+
+    # --- 3. Regression / correlation ---
+    results_df = pd.DataFrame(results)
+
+    if results_df.empty:
+        print("No valid events with both crest height and rate-of-rise. Nothing to do.")
+        return
+
+    x = results_df["rate_of_rise_per_hr"].values
+    y = results_df["crest_height"].values
+
     slope, intercept, r_value, p_value, std_err = linregress(x, y)
-    r_squared = r_value ** 2
-    
-    print("\n--- ANALYSIS RESULTS ---")
-    print(f"Events Analyzed successfully: {len(results_df)}")
-    print(f"Correlation (r): {r_value:.2f} (1.0 is a perfect positive correlation)")
-    print(f"Skill / Variance Explained (R-squared): {r_squared:.2f} (0 to 1.0 scale)")
-    print(f"Formula: Expected Crest = ({slope:.2f} * Rate of Rise at {reference_stage}ft) + {intercept:.2f}")
-    
-    # --- 5. Plotting ---
+    r_squared = r_value**2
+
+    print("--- ANALYSIS RESULTS ---")
+    print(f"Events analyzed successfully: {len(results_df)}")
+    print(f"Correlation (r):                {r_value:.2f}")
+    print(f"Skill / Variance Explained R²: {r_squared:.2f}")
+    print(
+        f"Regression formula:\n"
+        f"  Expected Crest (ft) = {slope:.3f} * Rate_of_Rise(ft/hr) + {intercept:.3f}"
+    )
+    print(f"P-value for slope: {p_value:.4g}")
+    print(f"Std error of slope: {std_err:.3f}\n")
+
+    # --- 4. Scatterplot + trendline ---
     plt.figure(figsize=(10, 6))
-    plt.scatter(x, y, color='blue', label='Historic Events')
-    
-    # Draw the line of best fit
+    plt.scatter(x, y, label="Historic Events")
+
     line_x = np.linspace(x.min(), x.max(), 100)
     line_y = slope * line_x + intercept
-    plt.plot(line_x, line_y, color='red', label=f'Trendline (R² = {r_squared:.2f})')
-    
-    plt.title(f"Predicting Bogue Chitto Crest based on Rate of Rise at {reference_stage} ft")
-    plt.xlabel("Rate of Rise (feet per hour)")
-    plt.ylabel("Eventual Crest Height (feet)")
+    plt.plot(line_x, line_y, label=f"Best-fit line (R² = {r_squared:.2f})")
+
+    plt.title(
+        f"Bogue Chitto near Tylertown:\n"
+        f"Crest Height vs Rate of Rise at {REFERENCE_STAGE} ft"
+    )
+    plt.xlabel("Rate of Rise at reference stage (ft per hour)")
+    plt.ylabel("Eventual Crest Height (ft)")
+    plt.grid(True, linestyle="--", alpha=0.6)
     plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
     plt.show()
-else:
-    print("Not enough high-resolution historical data found to run the analysis.")
+
+
+if __name__ == "__main__":
+    main()
