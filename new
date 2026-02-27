@@ -1,0 +1,106 @@
+import pandas as pd
+import requests
+import re
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.stats import linregress
+from datetime import timedelta
+
+# --- 1. Load the CSV ---
+# Adjust names based on your spreadsheet columns
+df = pd.read_csv("bogue_chitto_tylertown_historiccrests.csv", header=None, names=["rank", "height_str", "date_str", "empty"])
+
+# Extract numerical height and datetime objects
+df['crest_height'] = df['height_str'].apply(lambda x: float(re.search(r'[\d\.]+', str(x)).group()) if pd.notnull(x) else None)
+df['crest_date'] = df['date_str'].apply(lambda x: pd.to_datetime(re.search(r'\d{2}-\d{2}-\d{4}', str(x)).group()) if pd.notnull(x) else None)
+df = df.dropna(subset=['crest_height', 'crest_date'])
+
+# --- 2. Configuration ---
+station_id = "02490500" # USGS ID for Bogue Chitto River near Tylertown, MS
+reference_stage = 15.0  # The stage at which we want to check the rate of rise (e.g., Flood Stage)
+results = []
+
+print(f"Fetching USGS data for {len(df)} historic events. This may take a minute...")
+
+# --- 3. Fetch Data & Calculate Rate of Rise ---
+for index, row in df.iterrows():
+    crest_date = row['crest_date']
+    crest_height = row['crest_height']
+    
+    # We want data from 4 days before the crest to 1 day after
+    start_dt = (crest_date - timedelta(days=4)).strftime('%Y-%m-%d')
+    end_dt = (crest_date + timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    # Query USGS NWIS Instantaneous Values API (Parameter 00065 is Gage Height)
+    url = f"https://nwis.waterservices.usgs.gov/nwis/iv/?site={station_id}&startDT={start_dt}&endDT={end_dt}&parameterCd=00065&format=json"
+    
+    try:
+        response = requests.get(url)
+        data = response.json()
+        
+        # Check if USGS actually has 15-min data for this historical date
+        if 'value' in data and 'timeSeries' in data['value'] and len(data['value']['timeSeries']) > 0:
+            ts_data = data['value']['timeSeries'][0]['values'][0]['value']
+            
+            # Convert JSON to a DataFrame
+            event_df = pd.DataFrame(ts_data)
+            event_df['value'] = pd.to_numeric(event_df['value'], errors='coerce')
+            event_df['dateTime'] = pd.to_datetime(event_df['dateTime'])
+            event_df = event_df.set_index('dateTime').dropna()
+            
+            # Resample to Hourly to smooth out 15-min jitters and get Hourly Rate of Rise
+            hourly_df = event_df.resample('1H').mean()
+            hourly_df['rate_of_rise'] = hourly_df['value'].diff() # ft per hour difference
+            
+            # Find the earliest time it crossed our reference stage (15 ft)
+            crossed_idx = hourly_df[hourly_df['value'] >= reference_stage].index.min()
+            
+            if pd.notnull(crossed_idx):
+                rate = hourly_df.loc[crossed_idx, 'rate_of_rise']
+                
+                # Make sure the river was rising (positive rate) and not on the falling limb
+                if rate > 0:
+                    results.append({
+                        'crest_date': crest_date.date(),
+                        'crest_height': crest_height,
+                        'rate_of_rise_per_hr': rate
+                    })
+    except Exception as e:
+        # USGS 15-minute gauge data usually only goes back to the late 80s / early 90s.
+        # Older events (like 1936) will gracefully fail here.
+        pass
+
+# --- 4. The "Fancier" Math (Correlation & Skill) ---
+results_df = pd.DataFrame(results)
+
+if len(results_df) > 0:
+    x = results_df['rate_of_rise_per_hr']
+    y = results_df['crest_height']
+    
+    # Linear Regression
+    slope, intercept, r_value, p_value, std_err = linregress(x, y)
+    r_squared = r_value ** 2
+    
+    print("\n--- ANALYSIS RESULTS ---")
+    print(f"Events Analyzed successfully: {len(results_df)}")
+    print(f"Correlation (r): {r_value:.2f} (1.0 is a perfect positive correlation)")
+    print(f"Skill / Variance Explained (R-squared): {r_squared:.2f} (0 to 1.0 scale)")
+    print(f"Formula: Expected Crest = ({slope:.2f} * Rate of Rise at {reference_stage}ft) + {intercept:.2f}")
+    
+    # --- 5. Plotting ---
+    plt.figure(figsize=(10, 6))
+    plt.scatter(x, y, color='blue', label='Historic Events')
+    
+    # Draw the line of best fit
+    line_x = np.linspace(x.min(), x.max(), 100)
+    line_y = slope * line_x + intercept
+    plt.plot(line_x, line_y, color='red', label=f'Trendline (R² = {r_squared:.2f})')
+    
+    plt.title(f"Predicting Bogue Chitto Crest based on Rate of Rise at {reference_stage} ft")
+    plt.xlabel("Rate of Rise (feet per hour)")
+    plt.ylabel("Eventual Crest Height (feet)")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.show()
+else:
+    print("Not enough high-resolution historical data found to run the analysis.")
